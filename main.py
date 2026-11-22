@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("DISABLE_AIOHTTP_TRANSPORT", "True")
+os.environ.setdefault("LITELLM_DISABLE_AIOHTTP_TRANSPORT", "True")
 import argparse
 import asyncio
 import logging
@@ -88,7 +91,7 @@ class FallTemplateBot2026(ForecastBot):
                 model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
                 temperature=0.3,
                 timeout=40,
-                allowed_tries=2,
+                allowed_tries=8,
             ),
             "summarizer": "openai/gpt-4o-mini",
             "researcher": "asknews/news-summaries",
@@ -709,23 +712,23 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="gemini/gemma-4-31b-it",
+                temperature=0.3,
+                timeout=120,
+                allowed_tries=8,
+            ),
+            "summarizer": "gemini/gemini-3.1-flash-lite",
+            "researcher": GeneralLlm(model="gemini/gemini-3.5-flash", timeout=120, allowed_tries=8),
+            "parser": "gemini/gemini-3.1-flash-lite",
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
