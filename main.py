@@ -2,6 +2,8 @@ import os
 os.environ.setdefault("DISABLE_AIOHTTP_TRANSPORT", "True")
 os.environ.setdefault("LITELLM_DISABLE_AIOHTTP_TRANSPORT", "True")
 import argparse
+import json
+import re
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -44,8 +46,24 @@ from forecasting_tools import (
     structure_output,
 )
 
+from free_research import (
+    extract_urls,
+    fetch_url_text,
+    format_headlines,
+    gdelt,
+    google_news,
+    heuristic_query,
+    market_anchors,
+    wikipedia,
+)
+from llm_guard import GuardedForecaster, guarded_invoke
+from numeric_tools import smooth_distribution
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+HELPER_MODEL = "gemini/gemini-3.1-flash-lite"
+HELPER_FALLBACK_MODEL = "gemini/gemini-3.5-flash"
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -108,7 +126,7 @@ class FallTemplateBot2026(ForecastBot):
     # OR
     summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
     # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
+    reasoning = await self._forecast_invoke(prompt)
     ```
 
     If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
@@ -131,40 +149,114 @@ class FallTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
 
+    _forecaster = GuardedForecaster()
+
+    async def _forecast_invoke(self, prompt: str) -> str:
+        """Gemma with throttle/retry; falls back to flash-lite / 3.5-flash."""
+        return await self._forecaster.invoke(prompt)
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = self._get_research_prompt(question, researcher)
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
+            try:
+                research = await asyncio.wait_for(self._free_research(question), timeout=420)
+            except Exception as e:
+                logger.warning(f"Research pipeline failed for {question.page_url}: {e}")
+                research = (
+                    f"Research brief unavailable (research tools failed on "
+                    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}). Rely on the question text."
                 )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    async def _helper_invoke(self, prompt: str) -> str:
+        try:
+            return await guarded_invoke(HELPER_MODEL, prompt, attempts=3)
+        except Exception as e:
+            logger.warning(f"Helper model failed ({e}); trying {HELPER_FALLBACK_MODEL}")
+            return await guarded_invoke(HELPER_FALLBACK_MODEL, prompt, attempts=2)
+
+    async def _write_queries(self, question: MetaculusQuestion) -> dict:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        prompt = clean_indents(
+            f"""
+            Today is {today}. Write web search queries to research this forecasting question.
+            Return ONLY a JSON object with keys:
+            "news_queries": 3 short Google News queries (3-7 words each): one for the main subject's latest status,
+               one per key resolution condition, one for a base rate / historical comparison;
+            "wiki_query": 1-4 words naming the best Wikipedia article;
+            "market_query": 2-4 keywords to find the same event on prediction markets (Polymarket/Kalshi/Manifold).
+
+            Question: {question.question_text}
+            Resolution criteria: {(question.resolution_criteria or '')[:1500]}
+            """
+        )
+        try:
+            raw = await self._helper_invoke(prompt)
+            m = re.search(r"\{.*\}", raw, re.S)
+            data = json.loads(m.group(0)) if m else {}
+        except Exception as e:
+            logger.warning(f"Query writer failed: {e}")
+            data = {}
+        base = heuristic_query(question.question_text)
+        nq = [q for q in data.get("news_queries", []) if isinstance(q, str) and q.strip()][:3] or [base]
+        return {
+            "news_queries": nq,
+            "wiki_query": data.get("wiki_query") or base,
+            "market_query": data.get("market_query") or heuristic_query(question.question_text, 5),
+        }
+
+    async def _free_research(self, question: MetaculusQuestion) -> str:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        q = await self._write_queries(question)
+        urls = extract_urls(
+            question.resolution_criteria or "", question.fine_print or "", question.background_info or ""
+        )[:3]
+        tasks = [google_news(nq, 8, days=(30 if i == 0 else None)) for i, nq in enumerate(q["news_queries"])]
+        tasks.append(gdelt(q["news_queries"][0], 8))
+        tasks.append(wikipedia(q["wiki_query"]))
+        tasks.extend(fetch_url_text(u) for u in urls)
+        tasks.append(market_anchors(q["market_query"], question.question_text))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = [r if not isinstance(r, BaseException) else "" for r in results]
+        n_news = len(q["news_queries"]) + 1
+        headlines = [it for r in results[:n_news] if isinstance(r, list) for it in r]
+        wiki = results[n_news] or ""
+        pages = [r for r in results[n_news + 1 : n_news + 1 + len(urls)] if r]
+        markets = results[-1] or "Prediction markets: lookup failed."
+        headline_text = format_headlines(headlines, 16)
+        raw = (
+            f"NEWS HEADLINES (newest first):\n{headline_text or 'none found'}\n\n"
+            f"{wiki}\n\n" + "\n\n".join(pages)
+        )[:24000]
+        summary_prompt = clean_indents(
+            f"""
+            Today is {today}. You are a research assistant for a forecaster. Using ONLY the material below
+            (dated news headlines, a Wikipedia extract, and pages named in the resolution criteria),
+            write a research brief of at most 300 words for the question.
+            - Lead with the most recent relevant facts, each with its date (YYYY-MM-DD) and source name.
+            - State the current status relative to the resolution criteria and any scheduled dates/deadlines.
+            - Mention the latest data value if a data series is involved.
+            - Note base rates or history only if the material supports them.
+            - Say clearly if the material is thin or not directly relevant. Do not invent facts. Do not forecast.
+
+            Question: {question.question_text}
+            Resolution criteria: {(question.resolution_criteria or '')[:1200]}
+
+            MATERIAL:
+            {raw}
+            """
+        )
+        try:
+            summary = await self._helper_invoke(summary_prompt)
+        except Exception as e:
+            logger.warning(f"Summarizer failed, using raw headlines: {e}")
+            summary = "Recent headlines:\n" + (headline_text[:2500] or "none found")
+        fred = "\n".join(p for p in pages if p.startswith("FRED "))
+        parts = [f"Research brief compiled {today} (UTC) from Google News, GDELT, Wikipedia and resolution-source pages:", summary.strip()]
+        if fred:
+            parts.append(fred)
+        parts.append(markets)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _get_research_prompt(
@@ -190,6 +282,47 @@ class FallTemplateBot2026(ForecastBot):
             """
         )
         return prompt
+
+    ##################################### COMMENT #####################################
+
+    def _create_unified_explanation(
+        self,
+        question,
+        research_prediction_collections,
+        aggregated_prediction,
+        final_cost,
+        time_spent_in_minutes,
+    ) -> str:
+        """Compact private comment: final forecast, the dated brief, short rationale tails."""
+        from forecasting_tools.data_models.data_organizer import DataOrganizer
+
+        report_type = DataOrganizer.get_report_type_for_question_type(type(question))
+
+        def clean(t: str) -> str:
+            return re.sub(r"(?m)^#+\s*", "", t or "").strip()
+
+        forecasts, research, rationales = [], [], []
+        for collection in research_prediction_collections:
+            research.append(clean(collection.research_report)[:3500])
+            for j, f in enumerate(collection.predictions):
+                forecasts.append(
+                    f"*Forecaster {j + 1}*: {report_type.make_readable_prediction(f.prediction_value)}"
+                )
+                tail = clean(f.reasoning)
+                if len(tail) > 900:
+                    tail = "..." + tail[-900:]
+                rationales.append(f"## Forecaster {j + 1}\n{tail}")
+        forecasts_text = "\n".join(forecasts)
+        research_text = "\n\n".join(research)
+        rationales_text = "\n\n".join(rationales)
+        return (
+            f"# SUMMARY\n*Question*: {question.question_text}\n"
+            f"*Final Prediction*: {report_type.make_readable_prediction(aggregated_prediction)}\n"
+            f"*Bot*: {self.__class__.__name__}, forecaster {self._forecaster.last_model_used}, "
+            f"{round(time_spent_in_minutes, 1)} min\n\n{forecasts_text}\n\n"
+            f"# RESEARCH\n{research_text}\n\n"
+            f"# FORECASTS\n{rationales_text}\n"
+        )
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -238,7 +371,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -320,7 +453,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -383,16 +516,26 @@ class FallTemplateBot2026(ForecastBot):
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns,
+            and that the 1st and 99th percentiles should cover surprises (data revisions, shocks, definition changes).
+            If a bound is described as "likely not higher/lower" (an open bound), you may put tail percentiles beyond it when you believe mass is there.
+            Double-check the units: your numbers must be in "{question.unit_of_measure if question.unit_of_measure else 'the units implied by the question'}" and on the same scale as the range given above.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: XX (lowest number value)
+            Percentile 1: XX (lowest number value)
+            Percentile 5: XX
+            Percentile 10: XX
             Percentile 20: XX
+            Percentile 30: XX
             Percentile 40: XX
+            Percentile 50: XX
             Percentile 60: XX
+            Percentile 70: XX
             Percentile 80: XX
-            Percentile 90: XX (highest number value)
+            Percentile 90: XX
+            Percentile 95: XX
+            Percentile 99: XX (highest number value)
             "
             """
         )
@@ -403,7 +546,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -416,6 +559,7 @@ class FallTemplateBot2026(ForecastBot):
             - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
             - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
             - If the answer doesn't give the answer in the correct units, you should parse it in the right units. For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
+            - Parse every percentile in the final answer (typically 1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99), expressed as decimals (e.g. 0.01, 0.05, ..., 0.99).
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             - Turn any values that are in scientific notation into regular numbers.
             """
@@ -427,7 +571,11 @@ class FallTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        try:
+            prediction = smooth_distribution(percentile_list, question)
+        except Exception as e:
+            logger.warning(f"Smoothing failed ({e}); using template CDF for {question.page_url}")
+            prediction = NumericDistribution.from_question(percentile_list, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
@@ -499,7 +647,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecast_invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -700,6 +848,18 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--loop-minutes",
+        type=float,
+        default=0,
+        help="Keep checking for new questions for this many minutes (tournament mode)",
+    )
+    parser.add_argument(
+        "--check-interval-minutes",
+        type=float,
+        default=6,
+        help="Minutes between checks when --loop-minutes > 0",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
@@ -714,6 +874,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
+        enable_summarize_research=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
@@ -726,7 +887,7 @@ if __name__ == "__main__":
                 allowed_tries=8,
             ),
             "summarizer": "gemini/gemini-3.1-flash-lite",
-            "researcher": GeneralLlm(model="gemini/gemini-3.5-flash", timeout=120, allowed_tries=8),
+            "researcher": "free-sources/google-news+gdelt+wikipedia+markets+gemini/gemini-3.1-flash-lite",
             "parser": "gemini/gemini-3.1-flash-lite",
         },
     )
@@ -745,17 +906,55 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+        import time as _time
+
+        tournament_ids = [client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID]
+        failures: dict[str, int] = {}
+        MAX_ATTEMPTS_PER_RUN = 2
+
+        async def _one_pass() -> list:
+            reports: list = []
+            for tid in tournament_ids:
+                try:
+                    questions = client.get_all_open_questions_from_tournament(tid)
+                except Exception as e:
+                    logger.error(f"Could not list questions for {tid}: {e}")
+                    continue
+                todo = [
+                    q
+                    for q in questions
+                    if not q.already_forecasted
+                    and failures.get(str(q.id_of_question or q.page_url), 0) < MAX_ATTEMPTS_PER_RUN
+                ]
+                logger.info(f"Tournament {tid}: {len(questions)} open, {len(todo)} to forecast")
+                if not todo:
+                    continue
+                results = await template_bot.forecast_questions(todo, return_exceptions=True)
+                for q, r in zip(todo, results):
+                    if isinstance(r, BaseException):
+                        key = str(q.id_of_question or q.page_url)
+                        failures[key] = failures.get(key, 0) + 1
+                reports.extend(results)
+            return reports
+
+        async def _loop() -> list:
+            deadline = _time.time() + args.loop_minutes * 60
+            all_reports: list = []
+            pass_no = 0
+            while True:
+                pass_no += 1
+                logger.info(f"=== Check #{pass_no} for new questions ===")
+                try:
+                    all_reports.extend(await _one_pass())
+                except Exception as e:
+                    logger.error(f"Check #{pass_no} failed: {e}")
+                remaining = deadline - _time.time()
+                if remaining < args.check_interval_minutes * 60:
+                    break
+                await asyncio.sleep(args.check_interval_minutes * 60)
+            return all_reports
+
+        forecast_reports = asyncio.run(_loop())
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and

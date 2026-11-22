@@ -2,10 +2,18 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "Minutes to keep checking for new questions (0 = single pass)"
+        required: false
+        default: "52"
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+    # GitHub cron is unreliable (many firings are dropped), so fire often as a backup.
+    # Each run loops for ~52 min checking for new questions every 6 min, so a single
+    # delivered firing per hour keeps coverage continuous. Already-forecasted questions are skipped.
+    - cron: "4,19,34,49 * * * *"
 
-# Add concurrency group to prevent parallel runs
+# One run at a time; a newer trigger waits (only the latest pending run is kept).
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -15,6 +23,7 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    timeout-minutes: 300
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -30,7 +39,7 @@ jobs:
         run: uv sync --locked
       - name: Run bot
         run: |
-          uv run python main.py
+          uv run python main.py --mode tournament --loop-minutes ${{ github.event.inputs.loop_minutes || '52' }} --check-interval-minutes 6
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
