@@ -8,7 +8,7 @@ on:
         required: false
         default: "0"
   schedule:
-    # Single pass every 30 min (questions stay open ~3h). Lowered 2026-11-23 after Actions
+    # Single pass every 30 min (questions stay open ~3h). Re-registered schedule 2026-11-23 21:40 CST. Lowered 2026-11-23 after Actions
     # was disabled on this repo following the old 15-min cron + 52-min loop setup.
     - cron: "11,41 * * * *"
 
