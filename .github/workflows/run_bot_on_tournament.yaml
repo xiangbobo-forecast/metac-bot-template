@@ -6,12 +6,11 @@ on:
       loop_minutes:
         description: "Minutes to keep checking for new questions (0 = single pass)"
         required: false
-        default: "52"
+        default: "0"
   schedule:
-    # GitHub cron is unreliable (many firings are dropped), so fire often as a backup.
-    # Each run loops for ~52 min checking for new questions every 6 min, so a single
-    # delivered firing per hour keeps coverage continuous. Already-forecasted questions are skipped.
-    - cron: "4,19,34,49 * * * *"
+    # Single pass every 30 min (questions stay open ~3h). Lowered 2026-11-23 after Actions
+    # was disabled on this repo following the old 15-min cron + 52-min loop setup.
+    - cron: "11,41 * * * *"
 
 # One run at a time; a newer trigger waits (only the latest pending run is kept).
 concurrency:
@@ -23,7 +22,7 @@ concurrency:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
-    timeout-minutes: 300
+    timeout-minutes: 40
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -39,7 +38,7 @@ jobs:
         run: uv sync --locked
       - name: Run bot
         run: |
-          uv run python main.py --mode tournament --loop-minutes ${{ github.event.inputs.loop_minutes || '52' }} --check-interval-minutes 6
+          uv run python main.py --mode tournament --loop-minutes ${{ github.event.inputs.loop_minutes || '0' }} --check-interval-minutes 6
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
