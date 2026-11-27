@@ -112,6 +112,22 @@ def unit_check(values: np.ndarray, scale: _Scale) -> np.ndarray:
     )
 
 
+def clamp_to_allowed(percentiles: list[Percentile], question: NumericQuestion) -> list[Percentile]:
+    """forecasting_tools rejects any value beyond bounds +/- 2x range; pull extreme tails in to 1.9x."""
+    lo, hi = float(question.lower_bound), float(question.upper_bound)
+    rng = abs(hi - lo)
+    a, b = lo - 1.9 * rng, hi + 1.9 * rng
+    out: list[Percentile] = []
+    for p in sorted(percentiles, key=lambda q: float(q.percentile)):
+        v = min(max(float(p.value), a), b)
+        if out and v <= out[-1].value:
+            v = out[-1].value + rng * 1e-4
+            if v > b:
+                continue
+        out.append(Percentile(percentile=float(p.percentile), value=v))
+    return out
+
+
 def smooth_distribution(percentiles: list[Percentile], question: NumericQuestion) -> NumericDistribution:
     lo, hi = float(question.lower_bound), float(question.upper_bound)
     scale = _Scale(lo, hi, question.zero_point)
@@ -190,6 +206,7 @@ def smooth_distribution(percentiles: list[Percentile], question: NumericQuestion
         final.append(Percentile(percentile=float(h), value=float(v)))
     if len(final) < 3:
         raise ValueError("Too few usable percentiles after smoothing")
+    final = clamp_to_allowed(final, question)
     dist = NumericDistribution.from_question(final, question)
     dist.get_cdf()  # validate now so failures fall back cleanly
     return dist

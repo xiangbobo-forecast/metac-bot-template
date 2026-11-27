@@ -57,7 +57,7 @@ from free_research import (
     wikipedia,
 )
 from llm_guard import GuardedForecaster, guarded_invoke
-from numeric_tools import smooth_distribution
+from numeric_tools import smooth_distribution, clamp_to_allowed
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -575,7 +575,7 @@ class FallTemplateBot2026(ForecastBot):
             prediction = smooth_distribution(percentile_list, question)
         except Exception as e:
             logger.warning(f"Smoothing failed ({e}); using template CDF for {question.page_url}")
-            prediction = NumericDistribution.from_question(percentile_list, question)
+            prediction = NumericDistribution.from_question(clamp_to_allowed(percentile_list, question), question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
